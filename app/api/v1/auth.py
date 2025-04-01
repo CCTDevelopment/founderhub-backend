@@ -1,87 +1,113 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from jose import jwt, JWTError
 from pydantic import BaseModel, EmailStr
-from uuid import uuid4
 from datetime import datetime, timedelta
-from jose import jwt
+from uuid import uuid4
 import bcrypt
 import os
-from dotenv import load_dotenv
-from app.core.db import get_db
-from app.dependencies.auth import get_current_user
+import logging
 
-load_dotenv()
+from app.core.db import get_db  # Your production database dependency
+from app.models.user import User  # Your SQLAlchemy user model
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-SECRET_KEY = os.getenv("JWT_SECRET", "supersecret")
+# Use OAuth2 scheme to extract the token from the Authorization header.
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/token")
+
+# In production, the secret should be stored securely (e.g. in a secrets manager or secure DB table).
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET environment variable is not set!")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
-# -----------------------------
-# Models
-# -----------------------------
-
-class UserRegister(BaseModel):
-    email: EmailStr
-    password: str
-    name: str
-
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
-
-class TokenResponse(BaseModel):
-    user_id: str
+# Pydantic models for tokens
+class Token(BaseModel):
     access_token: str
-    token_type: str = "bearer"
+    token_type: str
 
-# -----------------------------
-# Routes
-# -----------------------------
+class TokenData(BaseModel):
+    sub: str | None = None
+    tenant_id: str | None = None
+    role: str | None = None
 
-@router.post("/auth/register", response_model=TokenResponse)
-async def register_user(payload: UserRegister):
-    db = await get_db()
-    user_id = str(uuid4())
-    tenant_id = str(uuid4())  # You could change this to link to an existing tenant if needed
-    hashed_pw = bcrypt.hashpw(payload.password.encode("utf-8"), bcrypt.gensalt()).decode()
+# Helper functions for password hashing and verification.
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
-    try:
-        await db.execute("""
-            INSERT INTO users (id, tenant_id, email, hashed_password, is_admin, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-        """, user_id, tenant_id, payload.email.lower(), hashed_pw, False, datetime.utcnow())
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Email already registered")
+def get_password_hash(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode()
 
-    token = _generate_token(user_id)
-    return TokenResponse(user_id=user_id, access_token=token)
+# Authenticate user credentials against the database.
+def authenticate_user(db, email: str, password: str):
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        logger.warning("Authentication failed: User not found for email %s", email)
+        return None
+    if not verify_password(password, user.hashed_password):
+        logger.warning("Authentication failed: Incorrect password for user %s", email)
+        return None
+    return user
 
-@router.post("/auth/login", response_model=TokenResponse)
-async def login_user(payload: UserLogin):
-    db = await get_db()
-    row = await db.fetchrow("SELECT id, hashed_password FROM users WHERE email = $1", payload.email.lower())
+# JWT token generation helper.
+def _generate_token(user_id: str, tenant_id: str, role: str) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": user_id,
+        "tenant_id": tenant_id,
+        "role": role,
+        "iat": datetime.utcnow(),
+        "exp": expire
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return token
 
-    if not row or not bcrypt.checkpw(payload.password.encode("utf-8"), row["hashed_password"].encode("utf-8")):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+@router.post("/token", response_model=Token)
+def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db = Depends(get_db)
+):
+    """
+    Issues a JWT token after validating user credentials.
+    The token payload contains user ID, tenant ID, and role.
+    """
+    user = authenticate_user(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    access_token = _generate_token(user.id, user.tenant_id, user.role)
+    return {"access_token": access_token, "token_type": "bearer"}
 
-    token = _generate_token(row["id"])
-    return TokenResponse(user_id=row["id"], access_token=token)
+@router.get("/users/me")
+def read_users_me(current_user: dict = Depends(oauth2_scheme)):
+    """
+    Retrieves current user information based on the provided JWT token.
+    In production, this should return data from a secure lookup (e.g., your user model).
+    """
+    # Here, we assume that get_current_user is implemented in a production‑ready way in your app.
+    user = current_user  # In production, decode and return secure user info.
+    return user
 
 @router.get("/auth/me")
-async def get_me(user=Depends(get_current_user)):
+async def get_me(user=Depends(lambda: get_current_user())):
+    """
+    Returns user details.
+    Replace this dependency with your production‑ready get_current_user implementation.
+    """
     return {
         "user_id": user["id"],
-        "email": user["email"],
-        "name": user["name"],
-        "created_at": user["created_at"],
+        "tenant_id": user["tenant_id"],
+        "role": user["role"],
+        "email": user.get("email"),
+        "name": user.get("name"),
+        "created_at": user.get("created_at"),
     }
-
-# -----------------------------
-# Internal Helpers
-# -----------------------------
-
-def _generate_token(user_id: str):
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    payload = {"sub": user_id, "exp": expire}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)

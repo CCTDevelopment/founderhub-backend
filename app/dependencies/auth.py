@@ -4,9 +4,13 @@ from app.core.db import get_db
 import os
 from dotenv import load_dotenv
 
+# Load environment variables (ideally done once in your application's entry point)
 load_dotenv()
 
-SECRET_KEY = os.getenv("JWT_SECRET", "supersecret")
+# Ensure the JWT secret is set; do not use a fallback value in production.
+SECRET_KEY = os.getenv("JWT_SECRET")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET environment variable is not set!")
 ALGORITHM = "HS256"
 
 async def get_current_user(authorization: str = Header(...)):
@@ -24,11 +28,14 @@ async def get_current_user(authorization: str = Header(...)):
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     db = await get_db()
-    user = await db.fetchrow("""
+    user = await db.fetchrow(
+        """
         SELECT id, tenant_id, email, name, is_admin, created_at
         FROM users
         WHERE id = $1
-    """, user_id)
+        """,
+        user_id
+    )
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")

@@ -1,20 +1,30 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, status
 from pydantic import BaseModel
 from uuid import uuid4, UUID
 from datetime import datetime
-from app.core.db import get_db
-from app.dependencies.auth import get_current_user
 from typing import List, Optional
 import os
-from openai import AsyncOpenAI
+import logging
 from dotenv import load_dotenv
+from openai import AsyncOpenAI
 import traceback
 
+from app.core.db import get_db
+from app.dependencies.auth import get_current_user
+
+# Load environment variables (ideally done once at the application entry point)
 load_dotenv()
 
-# ✅ Init GPT client
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-print("🧠 OpenAI Key Loaded:", os.getenv("OPENAI_API_KEY")[:8] + "...")
+# Configure logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Ensure the OpenAI API key is set
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is not set!")
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+logger.info("OpenAI API Key loaded successfully.")
 
 router = APIRouter()
 
@@ -43,25 +53,28 @@ class IdeaOut(IdeaCreate):
 # POST /ideas
 # -----------------------------
 
-@router.post("/ideas", response_model=IdeaOut)
+@router.post("/ideas", response_model=IdeaOut, status_code=status.HTTP_201_CREATED)
 async def create_idea(payload: IdeaCreate, user=Depends(get_current_user)):
     db = await get_db()
     idea_id = str(uuid4())
     now = datetime.utcnow()
 
     try:
-        await db.execute("""
+        await db.execute(
+            """
             INSERT INTO ideas (
                 id, tenant_id, user_id,
                 title, problem, audience, solution, notes,
                 vetting_status, vetting_response, created_at, updated_at
             )
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending', NULL, $9, $10)
-        """, idea_id, user["tenant_id"], user["id"],
-             payload.title, payload.problem, payload.audience,
-             payload.solution, payload.notes, now, now)
-
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', NULL, $9, $10)
+            """,
+            idea_id, user["tenant_id"], user["id"],
+            payload.title, payload.problem, payload.audience,
+            payload.solution, payload.notes, now, now
+        )
     except Exception as e:
+        logger.exception("Failed to save idea.")
         raise HTTPException(status_code=500, detail="Failed to save idea")
 
     return IdeaOut(
@@ -80,16 +93,17 @@ async def create_idea(payload: IdeaCreate, user=Depends(get_current_user)):
 @router.get("/ideas", response_model=List[IdeaOut])
 async def get_user_ideas(user=Depends(get_current_user)):
     db = await get_db()
-
     try:
-        rows = await db.fetch("""
+        rows = await db.fetch(
+            """
             SELECT id, title, problem, audience, solution, notes,
                    vetting_status, vetting_response, created_at, updated_at
             FROM ideas
             WHERE user_id = $1
             ORDER BY created_at DESC
-        """, user["id"])
-
+            """,
+            user["id"]
+        )
         return [
             {
                 "id": str(row["id"]),
@@ -101,12 +115,12 @@ async def get_user_ideas(user=Depends(get_current_user)):
                 "vetting_status": row["vetting_status"],
                 "vetting_response": row["vetting_response"],
                 "created_at": row["created_at"],
-                "updated_at": row["updated_at"]
+                "updated_at": row["updated_at"],
             }
             for row in rows
         ]
-
     except Exception as e:
+        logger.exception("Failed to fetch ideas.")
         raise HTTPException(status_code=500, detail=f"Failed to fetch ideas: {str(e)}")
 
 # -----------------------------
@@ -116,16 +130,20 @@ async def get_user_ideas(user=Depends(get_current_user)):
 @router.get("/ideas/{id}")
 async def get_idea_by_id(id: UUID, user=Depends(get_current_user)):
     db = await get_db()
-    idea = await db.fetchrow("""
+    idea = await db.fetchrow(
+        """
         SELECT id, title, problem, audience, solution, notes, vetting_status,
                vetting_response, created_at, updated_at
         FROM ideas
         WHERE id = $1 AND user_id = $2
-    """, str(id), user["id"])
+        """,
+        str(id), user["id"]
+    )
 
     if not idea:
         raise HTTPException(status_code=404, detail="Idea not found")
 
+    # Convert UUID types to strings if needed.
     return {k: (str(v) if isinstance(v, UUID) else v) for k, v in dict(idea).items()}
 
 # -----------------------------
@@ -136,7 +154,8 @@ async def get_idea_by_id(id: UUID, user=Depends(get_current_user)):
 async def update_idea(id: UUID, payload: IdeaUpdate, user=Depends(get_current_user)):
     db = await get_db()
 
-    result = await db.execute("""
+    result = await db.execute(
+        """
         UPDATE ideas
         SET title = $1,
             problem = $2,
@@ -145,13 +164,15 @@ async def update_idea(id: UUID, payload: IdeaUpdate, user=Depends(get_current_us
             notes = $5,
             updated_at = NOW()
         WHERE id = $6 AND user_id = $7
-    """, payload.title, payload.problem, payload.audience,
-         payload.solution, payload.notes, str(id), user["id"])
+        """,
+        payload.title, payload.problem, payload.audience,
+        payload.solution, payload.notes, str(id), user["id"]
+    )
 
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail="Idea not found or unauthorized")
 
-    return { "status": "ok" }
+    return {"status": "ok"}
 
 # -----------------------------
 # POST /ideas/{id}/analyze
@@ -161,16 +182,19 @@ async def update_idea(id: UUID, payload: IdeaUpdate, user=Depends(get_current_us
 async def analyze_idea(id: UUID, user=Depends(get_current_user)):
     db = await get_db()
 
-    idea = await db.fetchrow("""
+    idea = await db.fetchrow(
+        """
         SELECT title, problem, audience, solution, notes
         FROM ideas
         WHERE id = $1 AND user_id = $2
-    """, str(id), user["id"])
+        """,
+        str(id), user["id"]
+    )
 
     if not idea:
         raise HTTPException(status_code=404, detail="Idea not found")
 
-    # Prompt
+    # Build prompt for GPT analysis
     prompt = f"""
 You are an intellectual sparring partner for a startup founder. Your job is not to affirm or praise. Your job is to challenge.
 
@@ -222,8 +246,7 @@ Notes: {idea['notes']}
 """
 
     try:
-        print("🧠 Sending to GPT-4o...")
-
+        logger.info("Sending idea analysis to GPT-4o...")
         response = await client.chat.completions.create(
             model="gpt-4o",
             messages=[
@@ -233,39 +256,44 @@ Notes: {idea['notes']}
             temperature=0.7,
             max_tokens=600
         )
-
         result = response.choices[0].message.content
-        print("✅ GPT Response:", result[:120])
+        logger.info("Received GPT response (first 120 chars): %s", result[:120])
 
-        await db.execute("""
+        await db.execute(
+            """
             UPDATE ideas
             SET vetting_response = $1,
                 vetting_status = 'analyzed',
                 updated_at = NOW()
             WHERE id = $2 AND user_id = $3
-        """, result, str(id), user["id"])
+            """,
+            result, str(id), user["id"]
+        )
 
         return {
             "vetting_response": result,
             "vetting_status": "analyzed"
         }
-
     except Exception as e:
-        traceback.print_exc()
+        logger.exception("GPT analysis failed")
         raise HTTPException(status_code=500, detail=f"GPT failed: {str(e)}")
+
+# -----------------------------
+# PUT /ideas/{id}/commit
+# -----------------------------
 
 @router.put("/ideas/{id}/commit")
 async def commit_idea(id: UUID, user=Depends(get_current_user)):
     db = await get_db()
-
-    result = await db.execute("""
+    result = await db.execute(
+        """
         UPDATE ideas
         SET vetting_status = 'committed',
             updated_at = NOW()
         WHERE id = $1 AND user_id = $2
-    """, str(id), user["id"])
-
+        """,
+        str(id), user["id"]
+    )
     if result == "UPDATE 0":
         raise HTTPException(status_code=404, detail="Idea not found or unauthorized")
-
-    return {"status": "committed"}, http_status.HTTP_200_OK
+    return {"status": "committed"}

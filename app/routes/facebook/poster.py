@@ -1,11 +1,15 @@
 import requests
 
 class FacebookPoster:
-    def __init__(self, page_token):
+    def __init__(self, page_token: str):
         self.api_url = "https://graph.facebook.com/me/feed"
         self.page_token = page_token
 
-    def post(self, message):
+    def post(self, message: str) -> dict | None:
+        """
+        Posts a message to the Facebook feed using the provided page token.
+        Returns a dict containing the post details if successful; otherwise, returns None.
+        """
         payload = {
             "message": message,
             "access_token": self.page_token
@@ -30,7 +34,6 @@ class FacebookPoster:
                     "page_id": page_id,
                     "full_id": full_post_id
                 }
-
             else:
                 print("⚠️ Post published but no post ID returned.")
                 return None
@@ -38,7 +41,8 @@ class FacebookPoster:
         except requests.exceptions.RequestException as e:
             print("❌ Failed to post:", str(e))
             try:
-                print("📡 Facebook error response:", response.json())
+                error_data = response.json()
+                print("📡 Facebook error response:", error_data)
             except Exception:
                 print("⚠️ Raw response:", response.text)
             return None
