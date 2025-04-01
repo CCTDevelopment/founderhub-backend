@@ -1,11 +1,17 @@
-from pydantic import BaseModel, EmailStr, Field
+# SQLAlchemy Model (app/models/user.py)
+from sqlalchemy import Column, String, Boolean, DateTime
+from app.core.db import Base
+from datetime import datetime
 
-class UserRegister(BaseModel):
-    email: EmailStr
-    password: str = Field(..., min_length=8, description="Password must be at least 8 characters")
-    name: str
-
-class UserOut(BaseModel):
-    user_id: str
-    access_token: str
-    token_type: str = "bearer"
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String(36), primary_key=True, index=True)  # Using 36 for UUID strings
+    tenant_id = Column(String(36), index=True, nullable=False)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    hashed_password = Column(String(255), nullable=False)
+    role = Column(String(50), default="user", nullable=False)
+    is_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    
+    def __repr__(self):
+        return f"<User id={self.id} email={self.email}>"
