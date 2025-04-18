@@ -1,27 +1,28 @@
 import os
 import uuid
-from datetime import datetime
-import openai
+import logging
+import jwt
+import httpx
 import psycopg2
+from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-# Load environment variables (ideally done once at your application startup)
+# Load environment variables
 load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# === ENV CONFIG ===
 router = APIRouter()
+GPU_API_URL = os.getenv("GPU_API_URL")
+GPU_API_SECRET = os.getenv("GPU_API_SECRET")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not all([GPU_API_URL, GPU_API_SECRET, OPENAI_API_KEY]):
+    raise RuntimeError("Missing required environment variables")
 
-class BlueprintRequest(BaseModel):
-    tenant_id: str
-    project_id: str
-    role: str  # e.g., "CEO", "CFO", "COO", "CTO", "Visionary", etc.
-
+# === DB ===
 def get_db_connection():
-    """
-    Establishes and returns a connection to the Postgres database.
-    """
     return psycopg2.connect(
         dbname=os.getenv("POSTGRES_DB"),
         user=os.getenv("POSTGRES_USER"),
@@ -30,114 +31,153 @@ def get_db_connection():
         port=os.getenv("POSTGRES_PORT", 5432)
     )
 
-def store_blueprint(tenant_id: str, project_id: str, role: str, blueprint: str) -> None:
-    """
-    Stores the generated blueprint in the 'business_blueprints' table with tenant and project identifiers.
-    """
+def store_blueprint(tenant_id: str, project_id: str, role: str, blueprint: str):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 INSERT INTO business_blueprints (id, tenant_id, project_id, role, blueprint, created_at)
                 VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (str(uuid.uuid4()), tenant_id, project_id, role, blueprint, datetime.utcnow())
-            )
+            """, (
+                str(uuid.uuid4()), tenant_id, project_id, role, blueprint, datetime.utcnow()
+            ))
         conn.commit()
     finally:
         conn.close()
 
+def log_token_usage(user_id: str, tenant_id: str, tokens: int, source: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO usage_log (id, user_id, tenant_id, tokens_used, source, endpoint, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                str(uuid.uuid4()), user_id, tenant_id, tokens, source,
+                "/ai-agents/build-business", datetime.utcnow()
+            ))
+        conn.commit()
+    finally:
+        conn.close()
+
+# === MODELS ===
+class BlueprintRequest(BaseModel):
+    tenant_id: str
+    project_id: str
+    role: str  # e.g. "ceo", "cfo", "visionary", etc.
+
+# === PROMPT BUILDER ===
 def build_prompt(role: str) -> str:
-    """
-    Constructs a detailed prompt for generating a business-building blueprint based on the executive role.
-    """
-    role_lower = role.lower()
-    if role_lower in ["ceo", "co-founder", "ceo/co-founder"]:
-        prompt = (
-            "You are an experienced CEO and Co-Founder with a proven track record of building successful startups from scratch. "
-            "Provide a detailed, step-by-step blueprint for building a new business that includes the following components:\n\n"
-            "1. **Vision and Mission:** Define a clear vision and mission statement for the company.\n\n"
-            "2. **Business Plan:** Outline a complete business plan, including market analysis, product strategy, target customer segments, revenue models, and competitive analysis.\n\n"
-            "3. **Key AI Bots and Automation Systems:** Identify and describe essential AI bots and automation systems for functions such as marketing, customer service, data analytics, operations, and finance.\n\n"
-            "4. **Actionable Tasks and Milestones:** Provide a comprehensive list of actionable steps and milestones, including timelines, priorities, and resource requirements.\n\n"
-            "5. **Company Infrastructure and Team Setup:** Explain how to set up the company's infrastructure, including the technology stack, organizational structure, team roles, and operational workflows.\n\n"
-            "Your response should be structured, clear, and contain specific, actionable items that a founder can follow to build the business from the ground up."
+    role = role.lower()
+    if role == "ceo":
+        return (
+            "You are a CEO. Think step-by-step to design a startup blueprint:\n"
+            "1. Vision\n2. Business Model\n3. Automation\n4. Milestones\n5. Org Structure"
         )
-    elif role_lower == "cfo":
-        prompt = (
-            "You are an experienced CFO with deep expertise in financial management and strategy. "
-            "Provide a detailed, step-by-step blueprint for building a robust financial infrastructure for a startup. "
-            "Include the following components:\n\n"
-            "1. **Financial Strategy and Planning:** Outline strategies for budgeting, fundraising, and financial forecasting.\n\n"
-            "2. **Financial Systems and Tools:** Recommend key systems and AI-driven tools for automated bookkeeping, expense management, and financial reporting.\n\n"
-            "3. **Risk Management:** Describe methods to identify, assess, and mitigate financial risks.\n\n"
-            "4. **Investor Relations:** Provide guidance on managing investor communications and reporting.\n\n"
-            "5. **Operational Efficiency:** Detail steps to optimize cash flow and reduce inefficiencies.\n\n"
-            "Your response should include clear, actionable items that a CFO can implement to build a strong financial foundation."
+    elif role == "cfo":
+        return (
+            "You are a CFO. Design a financial plan:\n"
+            "1. Forecasting\n2. Budgets\n3. Burn Rate\n4. Revenue Model\n5. Risk"
         )
-    elif role_lower == "coo":
-        prompt = (
-            "You are an experienced COO with extensive operational expertise in scaling startups. "
-            "Provide a detailed, step-by-step blueprint for establishing efficient and scalable operations. "
-            "Include the following components:\n\n"
-            "1. **Operational Strategy:** Outline strategies for planning, process optimization, and quality control.\n\n"
-            "2. **Infrastructure Setup:** Detail how to build and optimize company infrastructure including logistics, supply chain management, and workflow automation.\n\n"
-            "3. **Team and Culture:** Explain how to build and manage high-performing teams and foster a productive company culture.\n\n"
-            "4. **Technology and Automation:** Identify key operational tools and AI-driven systems to automate repetitive tasks.\n\n"
-            "5. **Performance Metrics:** Provide guidance on establishing key performance indicators (KPIs) and continuous improvement systems.\n\n"
-            "Your response should be structured and include actionable steps for a COO to implement operational excellence."
+    elif role == "coo":
+        return (
+            "You are a COO. Map out operations:\n"
+            "1. Infrastructure\n2. Processes\n3. KPIs\n4. Hiring\n5. Tools"
         )
-    elif role_lower == "cto":
-        prompt = (
-            "You are an experienced CTO with deep technical expertise in building scalable technology platforms. "
-            "Provide a detailed, step-by-step blueprint for establishing the technical foundation of a startup. "
-            "Include the following components:\n\n"
-            "1. **Technology Vision and Strategy:** Define a clear technology vision and roadmap that aligns with the company's goals.\n\n"
-            "2. **Product Development:** Outline the product development lifecycle including ideation, prototyping, development, and launch.\n\n"
-            "3. **Tech Stack and Infrastructure:** Recommend an optimal technology stack and infrastructure setup, including cloud services, databases, and security measures.\n\n"
-            "4. **Team Building and Culture:** Explain how to build a high-performing engineering team and foster a culture of innovation.\n\n"
-            "5. **Automation and AI:** Identify key AI and automation tools to streamline development processes and improve product quality.\n\n"
-            "Your response should include actionable items for a CTO to build a robust technical foundation."
+    elif role == "cto":
+        return (
+            "You are a CTO. Plan the technology stack:\n"
+            "1. Architecture\n2. DevOps\n3. ML Infrastructure\n4. AI Automation\n5. Security"
         )
-    elif role_lower in ["visionary", "visionair"]:
-        prompt = (
-            "You are a visionary leader with the ability to see market trends and emerging opportunities. "
-            "Provide a detailed blueprint for defining and executing a transformative vision for a startup. "
-            "Include the following components:\n\n"
-            "1. **Vision and Mission:** Define a compelling vision and mission that inspires innovation and long-term growth.\n\n"
-            "2. **Market Trends and Opportunities:** Explain how to identify emerging trends and untapped market opportunities.\n\n"
-            "3. **Strategic Innovation:** Outline strategies for fostering innovation, including R&D, disruptive technologies, and strategic partnerships.\n\n"
-            "4. **Leadership and Culture:** Provide guidance on building a culture that embraces change and continuous learning.\n\n"
-            "5. **Execution Roadmap:** Offer a step-by-step plan for translating visionary ideas into actionable strategies and milestones.\n\n"
-            "Your response should be forward-thinking and provide concrete steps for a visionary leader to drive transformative growth."
+    elif role in ["visionary", "visionair"]:
+        return (
+            "You are a visionary founder. Envision the future:\n"
+            "1. Market Trends\n2. Disruption Areas\n3. Culture\n4. Thought Leadership\n5. Roadmap"
+        )
+    elif role == "ai researcher":
+        return (
+            "You are an AI researcher. Develop an AI implementation blueprint:\n"
+            "1. Use Cases\n2. Model Types\n3. Dataset Strategy\n4. Ethics\n5. Tooling"
         )
     else:
-        prompt = (
-            f"You are an experienced executive in the role of {role}. "
-            "Provide a detailed, step-by-step blueprint covering the key strategic areas relevant to your role, which a startup can follow to build and scale its business. "
-            "Include actionable items, clear milestones, and recommendations for leveraging AI and automation where appropriate."
-        )
-    return prompt
+        return f"You are a strategic executive in the role of {role}. Build a full plan step-by-step."
 
+# === MAIN AI GENERATOR ===
+@retry(stop=stop_after_attempt(2), wait=wait_exponential())
+async def generate_blueprint(prompt: str, role: str, tenant_id: str, user_id: str) -> str:
+    # === Try GPU
+    try:
+        token = jwt.encode({
+            "sub": user_id,
+            "scope": "founderhub",
+            "iat": datetime.utcnow(),
+            "exp": datetime.utcnow() + timedelta(hours=12)
+        }, GPU_API_SECRET, algorithm="HS256")
+
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+
+        model = "llama3:8b" if role != "codegamma" else "codegemma:latest"
+
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                GPU_API_URL,
+                headers=headers,
+                json={"model": model, "prompt": prompt, "stream": False},
+                timeout=20
+            )
+            res.raise_for_status()
+            content = res.json().get("response", "").strip()
+            tokens = int(len(content.split()) / 0.75)
+            log_token_usage(user_id, tenant_id, tokens, "gpu")
+            return content
+
+    except Exception as gpu_error:
+        logging.warning("GPU fallback triggered: %s", gpu_error)
+
+    # === OpenAI fallback
+    try:
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient() as client:
+            res = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json={
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.8,
+                    "max_tokens": 1000
+                },
+                timeout=40
+            )
+            res.raise_for_status()
+            data = res.json()
+            content = data["choices"][0]["message"]["content"].strip()
+            tokens = data.get("usage", {}).get("total_tokens", int(len(content.split()) / 0.75))
+            log_token_usage(user_id, tenant_id, tokens, "openai")
+            return content
+
+    except Exception as openai_error:
+        logging.error("OpenAI Fallback failed: %s", openai_error)
+        raise HTTPException(status_code=500, detail="AI generation failed")
+
+# === API Endpoint ===
 @router.post("/ai-agents/build-business")
 async def build_business_blueprint(request: BlueprintRequest):
-    """
-    Generates a detailed blueprint for building a business from an executive perspective,
-    based on the provided tenant, project, and role information.
-    
-    The blueprint is generated using GPT-4 and then stored in SQL for record-keeping.
-    """
     prompt = build_prompt(request.role)
     try:
-        response = openai.ChatCompletion.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1500
+        blueprint = await generate_blueprint(
+            prompt=prompt,
+            role=request.role,
+            tenant_id=request.tenant_id,
+            user_id="founderhub"
         )
-        blueprint = response.choices[0].message.content.strip()
-        # Store the blueprint with tenant and project information
         store_blueprint(request.tenant_id, request.project_id, request.role, blueprint)
         return {
             "tenant_id": request.tenant_id,

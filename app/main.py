@@ -1,13 +1,34 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+import os
 import logging
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 
-# Import routers from various modules
+# === Load ENV ===
+load_dotenv()
+
+# === Logging ===
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# === Validate required ENV ===
+required_env = ["JWT_SECRET", "MS_CLIENT_ID", "MS_CLIENT_SECRET", "MS_TENANT_ID", "MS_SENDER_EMAIL", "DATABASE_URL"]
+missing = [var for var in required_env if not os.getenv(var)]
+if missing:
+    logger.warning(f"⚠️ Missing required .env variables: {', '.join(missing)}")
+else:
+    logger.info("✅ All critical environment variables loaded.")
+
+# === Config ===
+from app.core.config import load_config
+
+# === Routers ===
 from app.api.v1 import auth, ideas, idea_chat
 from app.routes import (
     waitlist,
-    projects,
     ai_agents,
     ai_chats,
     personality,
@@ -18,23 +39,43 @@ from app.routes import (
     linkedin_posts,
     free_advertising,
     growth_hacker,
-    cmo_design_full,
-    scheduler
+    cmo_design,
+    scheduler,
+    contacts,
+    projects,
+)
+from app.routes.crm import crm_leads, crm_tasks, crm_notes
+
+# === App lifecycle ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        await load_config()
+        logger.info("✅ Startup complete: config loaded.")
+        yield
+    except Exception as e:
+        logger.exception("❌ Startup failed.")
+        raise e
+    finally:
+        logger.info("🛑 Shutdown complete.")
+
+# === Initialize App ===
+app = FastAPI(
+    title="FounderHub API",
+    version="1.0.0",
+    lifespan=lifespan
 )
 
-# Import our configuration loader and database instance from a central module (e.g., from cmo_design_full)
-from app.routes.cmo_design_full import load_config, database
+# === Global Exception Handler ===
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    print("⚠️ Validation Error:", exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()}
+    )
 
-# Optionally, import KPI snapshot collector if needed
-from app.services.analytics.kb_collector import collect_kpi_snapshots
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = FastAPI(title="FounderHub API", version="1.0.0")
-
-# CORS configuration (update these origins as needed)
+# === CORS ===
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -47,47 +88,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Health check endpoint
+# === Health Check ===
 @app.get("/ping")
 async def ping():
     return {"status": "ok", "message": "FounderHub API is live"}
 
-# Include API routers with appropriate prefixes
+# === Mount API Routes ===
+# Core
 app.include_router(auth.router, prefix="/api")
 app.include_router(ideas.router, prefix="/api")
-app.include_router(idea_chat.router, prefix="/api")  # Deep-dive GPT chat
+app.include_router(idea_chat.router, prefix="/api")
 
+# CRM
+app.include_router(crm_leads.router, prefix="/api")
+app.include_router(crm_tasks.router, prefix="/api")
+app.include_router(crm_notes.router, prefix="/api")
+
+# Modules
 app.include_router(waitlist.router, prefix="/api")
-app.include_router(projects.router, prefix="/api")
 app.include_router(ai_agents.router, prefix="/api")
 app.include_router(ai_chats.router, prefix="/api")
 app.include_router(personality.router, prefix="/api")
 app.include_router(board.router, prefix="/api")
 app.include_router(documents.router, prefix="/api")
-
 app.include_router(ga.router, prefix="/api/ga")
 app.include_router(facebook_posts.router, prefix="/api/facebook/posts")
 app.include_router(linkedin_posts.router, prefix="/api/linkedin/posts")
 app.include_router(free_advertising.router, prefix="/api/free-advertising")
 app.include_router(growth_hacker.router, prefix="/api/growth-hacker")
-app.include_router(cmo_design_full.router, prefix="/api/cmo/design")
+app.include_router(cmo_design.router, prefix="/api/cmo/design")
 app.include_router(scheduler.router, prefix="/api/scheduler")
+app.include_router(projects.router, prefix="/api")
+app.include_router(contacts.router, prefix="/api")
 
-# Startup event: Connect to the database and load configuration from the system_config table.
-@app.on_event("startup")
-async def startup_event():
-    await database.connect()
-    await load_config()  # This loads API keys (OPENAI_API_KEY, FB_PAGE_TOKEN, etc.) from the database.
-    logger.info("Startup complete: Database connected and configuration loaded.")
-    
-    # Optionally, schedule periodic tasks (e.g., KPI snapshot collection)
-    # Example: await collect_kpi_snapshots(database, site_id="your_site_id")
-
-# Shutdown event: Disconnect from the database.
-@app.on_event("shutdown")
-async def shutdown_event():
-    await database.disconnect()
-    logger.info("Shutdown complete: Database disconnected.")
-
+# === Dev Hot Reload ===
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=os.getenv("ENV") == "dev")

@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Deep Dive Report</title>
+  <style>
+    @page {
+      size: A4;
+      margin: 1in;
+      @top-center {
+        content: "FounderHub | {{ idea.title }}";
+        font-size: 10px;
+        color: #555;
+      }
+      @bottom-center {
+        content: "Page " counter(page) " of " counter(pages);
+        font-size: 10px;
+        color: #555;
+      }
+    }
+
+    body {
+      font-family: 'Arial', sans-serif;
+      font-size: 11pt;
+      color: #333;
+      line-height: 1.5;
+    }
+
+    h1 {
+      font-size: 20pt;
+      color: #0d9488;
+      margin-bottom: 0.25em;
+    }
+
+    h2 {
+      font-size: 16pt;
+      margin-top: 1.5em;
+      color: #0f766e;
+    }
+
+    .logo {
+      width: 150px;
+      margin-bottom: 10px;
+    }
+
+    .section {
+      margin-bottom: 1.5em;
+    }
+
+    .message {
+      margin: 0.5em 0;
+      padding: 0.75em;
+      border-radius: 6px;
+    }
+
+    .user {
+      background-color: #f0f9ff;
+    }
+
+    .assistant {
+      background-color: #fefce8;
+    }
+
+    .metadata {
+      font-size: 10pt;
+      color: #666;
+      margin-bottom: 1em;
+    }
+  </style>
+</head>
+<body>
+  <img src="logo.png" class="logo" alt="FounderHub Logo" />
+
+  <h1>FounderHub Deep Dive Report</h1>
+
+  <div class="metadata">
+    <p><strong>Date:</strong> {{ date }}</p>
+    <p><strong>Viability Score:</strong> {{ score }}/100</p>
+    <p><strong>Tokens Used:</strong> {{ tokens_used }} / {{ token_limit }}</p>
+  </div>
+
+  <h2>🧠 Idea Summary</h2>
+  <div class="section">
+    <p><strong>Title:</strong> {{ idea.title }}</p>
+    <p><strong>Problem:</strong> {{ idea.problem }}</p>
+    <p><strong>Audience:</strong> {{ idea.audience }}</p>
+    <p><strong>Solution:</strong> {{ idea.solution }}</p>
+  </div>
+
+  <h2>💬 Chat Log</h2>
+  {% for msg in messages %}
+  <div class="message {{ msg.role }}">
+    <strong>{{ "Founder" if msg.role == "user" else "AI" }}:</strong>
+    <p>{{ msg.message }}</p>
+  </div>
+  {% endfor %}
+</body>
+</html>

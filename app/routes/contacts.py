@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import logging
 from datetime import datetime
 from typing import List, Optional
 
@@ -10,16 +11,21 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 
-# Load environment variables (ideally once at your application startup)
+# === Load .env + encryption setup
 load_dotenv()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 if not ENCRYPTION_KEY:
-    raise RuntimeError("ENCRYPTION_KEY environment variable is not set!")
+    raise RuntimeError("ENCRYPTION_KEY is not set")
 fernet = Fernet(ENCRYPTION_KEY.encode())
 
+# === Logger
+logger = logging.getLogger("contacts")
+logging.basicConfig(level=logging.INFO)
+
+# === FastAPI router
 router = APIRouter()
 
-# Database connection helper
+# === DB connection
 def get_db_connection():
     return psycopg2.connect(
         dbname=os.getenv("POSTGRES_DB"),
@@ -29,14 +35,14 @@ def get_db_connection():
         port=os.getenv("POSTGRES_PORT", 5432)
     )
 
-# Encryption helpers
+# === Encryption utils
 def encrypt_value(value: str) -> str:
     return fernet.encrypt(value.encode()).decode()
 
 def decrypt_value(value: str) -> str:
     return fernet.decrypt(value.encode()).decode()
 
-# Pydantic models for Contacts
+# === Pydantic Schemas
 class ContactCreate(BaseModel):
     tenant_id: str
     user_id: str
@@ -45,14 +51,13 @@ class ContactCreate(BaseModel):
     email: EmailStr
     phone: str
     tags: List[str]
-    # Notes are removed from the main contact object.
 
 class ContactUpdate(BaseModel):
-    name: Optional[str] = None
-    role: Optional[str] = None
-    email: Optional[EmailStr] = None
-    phone: Optional[str] = None
-    tags: Optional[List[str]] = None
+    name: Optional[str]
+    role: Optional[str]
+    email: Optional[EmailStr]
+    phone: Optional[str]
+    tags: Optional[List[str]]
 
 class ContactOut(BaseModel):
     id: str
@@ -66,44 +71,33 @@ class ContactOut(BaseModel):
     created_at: datetime
     updated_at: datetime
 
-# Endpoints for Contacts
+# === ROUTES
+
 @router.post("/contacts", response_model=ContactOut)
 async def create_contact(contact: ContactCreate):
-    conn = get_db_connection()
     contact_id = str(uuid.uuid4())
-    created_at = datetime.utcnow()
-    updated_at = created_at
+    now = datetime.utcnow()
 
     encrypted_email = encrypt_value(contact.email)
     encrypted_phone = encrypt_value(contact.phone)
-    tags_json = json.dumps(contact.tags)
 
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO contacts (id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    contact_id,
-                    contact.tenant_id,
-                    contact.user_id,
-                    contact.name,
-                    contact.role,
-                    encrypted_email,
-                    encrypted_phone,
-                    tags_json,
-                    created_at,
-                    updated_at,
-                )
-            )
-        conn.commit()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO contacts (id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    contact_id, contact.tenant_id, contact.user_id,
+                    contact.name, contact.role,
+                    encrypted_email, encrypted_phone,
+                    json.dumps(contact.tags),
+                    now, now
+                ))
+            conn.commit()
     except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
+        logger.exception("Failed to create contact")
+        raise HTTPException(status_code=500, detail="Database error")
 
     return ContactOut(
         id=contact_id,
@@ -114,29 +108,32 @@ async def create_contact(contact: ContactCreate):
         email=contact.email,
         phone=contact.phone,
         tags=contact.tags,
-        created_at=created_at,
-        updated_at=updated_at,
+        created_at=now,
+        updated_at=now,
     )
 
 @router.get("/contacts", response_model=List[ContactOut])
-async def get_contacts(tenant_id: str = Query(...)):
-    conn = get_db_connection()
+async def get_contacts(
+    tenant_id: str = Query(...),
+    limit: int = Query(50, le=100),
+    offset: int = Query(0)
+):
     contacts = []
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at
-                FROM contacts
-                WHERE tenant_id = %s
-                ORDER BY created_at DESC
-                """,
-                (tenant_id,)
-            )
-            rows = cur.fetchall()
-            for row in rows:
-                contacts.append(
-                    ContactOut(
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at
+                    FROM contacts
+                    WHERE tenant_id = %s
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s
+                """, (tenant_id, limit, offset))
+                rows = cur.fetchall()
+
+                for row in rows:
+                    contacts.append(ContactOut(
                         id=row[0],
                         tenant_id=row[1],
                         user_id=row[2],
@@ -147,97 +144,100 @@ async def get_contacts(tenant_id: str = Query(...)):
                         tags=json.loads(row[7]),
                         created_at=row[8],
                         updated_at=row[9],
-                    )
-                )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
+                    ))
+    except Exception:
+        logger.exception("Error fetching contacts")
+        raise HTTPException(status_code=500, detail="Database error")
+
     return contacts
+
+@router.get("/contacts/count")
+async def get_contact_count(tenant_id: str = Query(...)):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM contacts WHERE tenant_id = %s", (tenant_id,))
+                count = cur.fetchone()[0]
+    except Exception:
+        logger.exception("Error counting contacts")
+        raise HTTPException(status_code=500, detail="Database error")
+
+    return {"count": count}
 
 @router.get("/contacts/{contact_id}", response_model=ContactOut)
 async def get_contact_by_id(contact_id: str):
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at
-                FROM contacts
-                WHERE id = %s
-                """,
-                (contact_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Contact not found")
-            contact = ContactOut(
-                id=row[0],
-                tenant_id=row[1],
-                user_id=row[2],
-                name=row[3],
-                role=row[4],
-                email=decrypt_value(row[5]),
-                phone=decrypt_value(row[6]),
-                tags=json.loads(row[7]),
-                created_at=row[8],
-                updated_at=row[9],
-            )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
-    return contact
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT id, tenant_id, user_id, name, role, email, phone, tags, created_at, updated_at
+                    FROM contacts
+                    WHERE id = %s
+                """, (contact_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Contact not found")
+
+                return ContactOut(
+                    id=row[0],
+                    tenant_id=row[1],
+                    user_id=row[2],
+                    name=row[3],
+                    role=row[4],
+                    email=decrypt_value(row[5]),
+                    phone=decrypt_value(row[6]),
+                    tags=json.loads(row[7]),
+                    created_at=row[8],
+                    updated_at=row[9],
+                )
+    except Exception:
+        logger.exception("Error fetching contact by ID")
+        raise HTTPException(status_code=500, detail="Database error")
 
 @router.put("/contacts/{contact_id}", response_model=ContactOut)
 async def update_contact(contact_id: str, contact: ContactUpdate):
-    conn = get_db_connection()
-    updated_at = datetime.utcnow()
+    now = datetime.utcnow()
+
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM contacts WHERE id = %s", (contact_id,))
-            row = cur.fetchone()
-            if not row:
-                raise HTTPException(status_code=404, detail="Contact not found")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM contacts WHERE id = %s", (contact_id,))
+                row = cur.fetchone()
+                if not row:
+                    raise HTTPException(status_code=404, detail="Contact not found")
 
-            # Prepare updated values: use new values if provided, otherwise retain existing ones.
-            name = contact.name if contact.name is not None else row[3]
-            role = contact.role if contact.role is not None else row[4]
-            email = encrypt_value(contact.email) if contact.email is not None else row[5]
-            phone = encrypt_value(contact.phone) if contact.phone is not None else row[6]
-            tags = json.dumps(contact.tags) if contact.tags is not None else row[7]
+                updated_name = contact.name or row[3]
+                updated_role = contact.role or row[4]
+                updated_email = encrypt_value(contact.email) if contact.email else row[5]
+                updated_phone = encrypt_value(contact.phone) if contact.phone else row[6]
+                updated_tags = json.dumps(contact.tags) if contact.tags else row[7]
 
-            cur.execute(
-                """
-                UPDATE contacts
-                SET name = %s, role = %s, email = %s, phone = %s, tags = %s, updated_at = %s
-                WHERE id = %s
-                """,
-                (name, role, email, phone, tags, updated_at, contact_id)
-            )
-        conn.commit()
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
+                cur.execute("""
+                    UPDATE contacts
+                    SET name = %s, role = %s, email = %s, phone = %s, tags = %s, updated_at = %s
+                    WHERE id = %s
+                """, (
+                    updated_name, updated_role, updated_email, updated_phone,
+                    updated_tags, now, contact_id
+                ))
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to update contact")
+        raise HTTPException(status_code=500, detail="Database error")
 
     return await get_contact_by_id(contact_id)
 
 @router.delete("/contacts/{contact_id}")
 async def delete_contact(contact_id: str):
-    conn = get_db_connection()
     try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM contacts WHERE id = %s", (contact_id,))
-            if cur.rowcount == 0:
-                raise HTTPException(status_code=404, detail="Contact not found")
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        conn.close()
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM contacts WHERE id = %s", (contact_id,))
+                if cur.rowcount == 0:
+                    raise HTTPException(status_code=404, detail="Contact not found")
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to delete contact")
+        raise HTTPException(status_code=500, detail="Database error")
+
     return {"detail": "Contact deleted successfully"}

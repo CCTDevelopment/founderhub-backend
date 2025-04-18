@@ -1,7 +1,7 @@
 from sqlalchemy import Column, String, Float, Date, ForeignKey, TIMESTAMP, Index
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
-from app.db import Base
+from app.core import Base
 import uuid
 
 class GASite(Base):

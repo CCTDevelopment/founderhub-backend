@@ -1,16 +1,23 @@
-# app/core/db.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from app.core import Base
+from sqlalchemy.ext.declarative import declarative_base
 
-import asyncpg
 import os
 from dotenv import load_dotenv
-
 load_dotenv()
+Base = declarative_base()
 
-async def get_db():
-    return await asyncpg.connect(
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        database=os.getenv("POSTGRES_DB"),
-        host=os.getenv("POSTGRES_HOST"),
-        port=int(os.getenv("POSTGRES_PORT")),
-    )
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set!")
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

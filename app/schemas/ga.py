@@ -1,7 +1,6 @@
 from pydantic import BaseModel, UUID4
-from datetime import date
-from typing import Optional, List
-
+from datetime import date, datetime
+from typing import Optional
 
 class GASiteOut(BaseModel):
     id: UUID4
@@ -10,12 +9,10 @@ class GASiteOut(BaseModel):
     ga4_property_id: str
 
     class Config:
-        orm_mode = True
-
+        from_attributes = True
 
 class GACredentialsOut(BaseModel):
     ga4_credentials_json: str
-
 
 class GAMetricIn(BaseModel):
     site_id: UUID4
@@ -38,7 +35,6 @@ class DecisionLogIn(BaseModel):
     status: str
     reason: str
 
-
 class KPISnapshotOut(BaseModel):
     site_id: UUID4
     kpi_name: str
@@ -46,4 +42,4 @@ class KPISnapshotOut(BaseModel):
     report_date: date
 
     class Config:
-        orm_mode = True
+        from_attributes = True
